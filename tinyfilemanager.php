@@ -3834,8 +3834,6 @@ function fm_show_header_login()
             echo '<link rel="icon" href="' . fm_enc($favicon_path) . '" type="image/png">';
         } ?>
         <title><?php echo fm_enc(APP_TITLE) ?></title>
-        <?php print_external('pre-jsdelivr'); ?>
-        <?php print_external('css-bootstrap'); ?>
         <style>
             body.fm-login-page {
                 background-color: #f7f9fb;
