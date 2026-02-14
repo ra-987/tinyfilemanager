@@ -150,6 +150,9 @@ $ip_blacklist = array(
     '::'            // non-routable meta ipv6
 );
 
+// Trusted reverse proxy IPs/CIDRs for forwarded headers parsing (empty = disabled)
+$trusted_proxies = array();
+
 // if User has the external config file, try to use it to override the default config above [config.php]
 // sample config - https://tinyfilemanager.github.io/config-sample.txt
 $config_file = __DIR__ . '/config.php';
@@ -306,14 +309,20 @@ if (isset($_GET['logout'])) {
 if ($ip_ruleset != 'OFF') {
     function getClientIP()
     {
-        if (array_key_exists('HTTP_CF_CONNECTING_IP', $_SERVER)) {
-            return  $_SERVER["HTTP_CF_CONNECTING_IP"];
-        } else if (array_key_exists('HTTP_X_FORWARDED_FOR', $_SERVER)) {
-            return  $_SERVER["HTTP_X_FORWARDED_FOR"];
-        } else if (array_key_exists('REMOTE_ADDR', $_SERVER)) {
-            return $_SERVER['REMOTE_ADDR'];
-        } else if (array_key_exists('HTTP_CLIENT_IP', $_SERVER)) {
-            return $_SERVER['HTTP_CLIENT_IP'];
+        global $trusted_proxies;
+
+        $remote_addr = array_key_exists('REMOTE_ADDR', $_SERVER) ? trim($_SERVER['REMOTE_ADDR']) : '';
+        $trusted_proxy = fm_is_trusted_proxy($remote_addr, $trusted_proxies);
+
+        if ($trusted_proxy && array_key_exists('HTTP_CF_CONNECTING_IP', $_SERVER)) {
+            return trim($_SERVER['HTTP_CF_CONNECTING_IP']);
+        } else if ($trusted_proxy && array_key_exists('HTTP_X_FORWARDED_FOR', $_SERVER)) {
+            $forwarded_for = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+            return trim($forwarded_for[0]);
+        } else if ($trusted_proxy && array_key_exists('HTTP_CLIENT_IP', $_SERVER)) {
+            return trim($_SERVER['HTTP_CLIENT_IP']);
+        } else if (!empty($remote_addr)) {
+            return $remote_addr;
         }
         return '';
     }
@@ -569,6 +578,105 @@ function fm_deny_access($is_ajax = false)
     exit;
 }
 
+function fm_ip_in_cidr($ip, $cidr)
+{
+    if (strpos($cidr, '/') === false) {
+        return $ip === $cidr;
+    }
+
+    list($subnet, $mask) = explode('/', $cidr, 2);
+    $ip_bin = @inet_pton($ip);
+    $subnet_bin = @inet_pton($subnet);
+    if ($ip_bin === false || $subnet_bin === false || strlen($ip_bin) !== strlen($subnet_bin)) {
+        return false;
+    }
+
+    $mask = (int)$mask;
+    $bytes = (int)floor($mask / 8);
+    $bits = $mask % 8;
+
+    if ($bytes > 0 && substr($ip_bin, 0, $bytes) !== substr($subnet_bin, 0, $bytes)) {
+        return false;
+    }
+
+    if ($bits === 0) {
+        return true;
+    }
+
+    $mask_byte = chr((0xFF << (8 - $bits)) & 0xFF);
+    return ((ord($ip_bin[$bytes]) & ord($mask_byte)) === (ord($subnet_bin[$bytes]) & ord($mask_byte)));
+}
+
+function fm_is_trusted_proxy($ip, $trusted_proxies)
+{
+    if (!is_array($trusted_proxies) || empty($trusted_proxies) || empty($ip)) {
+        return false;
+    }
+    foreach ($trusted_proxies as $proxy) {
+        if (fm_ip_in_cidr($ip, trim($proxy))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function fm_is_private_or_reserved_ip($ip)
+{
+    if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+        return true;
+    }
+    return !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+}
+
+function fm_url_points_to_private_network($url)
+{
+    $parts = @parse_url($url);
+    if (!is_array($parts) || empty($parts['scheme']) || empty($parts['host'])) {
+        return true;
+    }
+    if (!in_array(strtolower($parts['scheme']), array('http', 'https'), true)) {
+        return true;
+    }
+
+    $host = $parts['host'];
+    $ip_candidates = array();
+
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        $ip_candidates[] = $host;
+    } else {
+        $dns_a = @dns_get_record($host, DNS_A);
+        if (is_array($dns_a)) {
+            foreach ($dns_a as $record) {
+                if (!empty($record['ip'])) {
+                    $ip_candidates[] = $record['ip'];
+                }
+            }
+        }
+        if (defined('DNS_AAAA')) {
+            $dns_aaaa = @dns_get_record($host, DNS_AAAA);
+            if (is_array($dns_aaaa)) {
+                foreach ($dns_aaaa as $record) {
+                    if (!empty($record['ipv6'])) {
+                        $ip_candidates[] = $record['ipv6'];
+                    }
+                }
+            }
+        }
+    }
+
+    if (empty($ip_candidates)) {
+        return true;
+    }
+
+    foreach ($ip_candidates as $resolved_ip) {
+        if (fm_is_private_or_reserved_ip($resolved_ip)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // always use ?p=
 if (!isset($_GET['p']) && empty($_FILES)) {
     fm_redirect(FM_SELF_URL . '?p=');
@@ -720,8 +828,14 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
             $cfg->data['theme'] = $te3;
             $theme = $te3;
         }
-        $cfg->save();
-        echo true;
+        $save_ok = $cfg->save();
+        header('Content-Type: application/json; charset=utf-8');
+        if ($save_ok) {
+            echo json_encode(array('status' => 'ok'));
+        } else {
+            header('HTTP/1.1 500 Internal Server Error');
+            echo json_encode(array('status' => 'error', 'message' => lng('Unable to save settings')));
+        }
     }
 
     // new password hash
@@ -756,13 +870,15 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
         }
 
         $url = !empty($_REQUEST["uploadurl"]) && preg_match("|^http(s)?://.+$|", stripslashes($_REQUEST["uploadurl"])) ? stripslashes($_REQUEST["uploadurl"]) : null;
-
-        //prevent 127.* domain and known ports
-        $domain = parse_url($url, PHP_URL_HOST);
         $port = parse_url($url, PHP_URL_PORT);
-        $knownPorts = [22, 23, 25, 3306];
+        $allowed_ports = array(80, 443);
+        if (!empty($port) && !in_array((int)$port, $allowed_ports, true)) {
+            $err = array("message" => "URL is not allowed");
+            event_callback(array("fail" => $err));
+            exit();
+        }
 
-        if (preg_match("/^localhost$|^127(?:\.[0-9]+){0,2}\.[0-9]+$|^(?:0*\:)*?:?0*1$/i", $domain) || in_array($port, $knownPorts)) {
+        if (fm_url_points_to_private_network($url)) {
             $err = array("message" => "URL is not allowed");
             event_callback(array("fail" => $err));
             exit();
@@ -803,7 +919,18 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
             $fileinfo->size = $curl_info["size_download"];
             $fileinfo->type = $curl_info["content_type"];
         } else {
-            $ctx = stream_context_create();
+            $ctx = stream_context_create(array(
+                'http' => array(
+                    'timeout' => 10,
+                    'follow_location' => 0,
+                    'max_redirects' => 0,
+                ),
+                'https' => array(
+                    'timeout' => 10,
+                    'follow_location' => 0,
+                    'max_redirects' => 0,
+                ),
+            ));
             @$success = copy($url, $temp_file, $ctx);
             if (!$success) {
                 $err = error_get_last();
@@ -1724,7 +1851,7 @@ if (isset($_POST['copy']) && (has_permission('can_copy') || has_permission('can_
                         echo '<input type="hidden" name="file[]" value="' . fm_enc($cf) . '">' . PHP_EOL;
                     }
                     ?>
-                    <p class="break-word"><strong><?php echo lng('Files') ?></strong>: <b><?php echo implode('</b>, <b>', $copy_files) ?></b></p>
+                    <p class="break-word"><strong><?php echo lng('Files') ?></strong>: <b><?php echo implode('</b>, <b>', array_map('fm_enc', $copy_files)) ?></b></p>
                     <p class="break-word"><strong><?php echo lng('SourceFolder') ?></strong>: <?php echo fm_enc(fm_convert_win(FM_ROOT_PATH . '/' . FM_PATH)) ?><br>
                         <label for="inp_copy_to"><strong><?php echo lng('DestinationFolder') ?></strong>:</label>
                         <?php echo FM_ROOT_PATH ?>/<input type="text" name="copy_to" id="inp_copy_to" value="<?php echo fm_enc(FM_PATH) ?>">
@@ -3614,9 +3741,14 @@ function fm_get_file_mimes($extension)
 function scan($dir = '', $filter = '')
 {
     $path = FM_ROOT_PATH . '/' . $dir;
+    $filter = trim((string)$filter);
+    if (strlen($filter) > 120) {
+        $filter = substr($filter, 0, 120);
+    }
+    $pattern = '/' . preg_quote($filter, '/') . '/i';
     if ($path) {
         $ite = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path));
-        $rii = new RegexIterator($ite, "/(" . $filter . ")/i");
+        $rii = new RegexIterator($ite, $pattern);
 
         $files = array();
         foreach ($rii as $file) {
@@ -3964,20 +4096,39 @@ class FM_Config
     function save()
     {
         global $config_file;
-        $fm_file = is_readable($config_file) ? $config_file : __FILE__;
+        $fm_file = __FILE__;
+        $lines = null;
+
+        if (is_readable($config_file)) {
+            $fm_file = $config_file;
+            $lines = file($fm_file);
+        } elseif (is_writable(dirname($config_file))) {
+            $fm_file = $config_file;
+            $lines = array();
+        } elseif (is_readable(__FILE__)) {
+            $lines = file(__FILE__);
+        }
+
         $var_name = '$CONFIG';
         $var_value = var_export(json_encode($this->data), true);
         $config_string = "<?php" . chr(13) . chr(10) . "//Default Configuration" . chr(13) . chr(10) . "$var_name = $var_value;" . chr(13) . chr(10);
         if (is_writable($fm_file)) {
-            $lines = file($fm_file);
             if ($fh = @fopen($fm_file, "w")) {
-                @fputs($fh, $config_string, strlen($config_string));
-                for ($x = 3; $x < count($lines); $x++) {
-                    @fputs($fh, $lines[$x], strlen($lines[$x]));
+                $ok = (@fputs($fh, $config_string, strlen($config_string)) !== false);
+                if ($ok && is_array($lines) && count($lines) > 3) {
+                    for ($x = 3; $x < count($lines); $x++) {
+                        if (@fputs($fh, $lines[$x], strlen($lines[$x])) === false) {
+                            $ok = false;
+                            break;
+                        }
+                    }
                 }
                 @fclose($fh);
+                return $ok;
             }
+            return false;
         }
+        return false;
     }
 }
 
@@ -4636,6 +4787,7 @@ function fm_show_header_login()
             }
 
             .main-nav {
+                background: var(--bs-tertiary-bg, #F7F7F7);
                 padding: 0.2rem 1rem;
                 box-shadow: 0 4px 5px 0 rgba(0, 0, 0, .14), 0 1px 10px 0 rgba(0, 0, 0, .12), 0 2px 4px -1px rgba(0, 0, 0, .2)
             }
@@ -4899,8 +5051,22 @@ function fm_show_header_login()
                 :root {
                     --bs-bg-opacity: 1;
                     --bg-color: #f3daa6;
+                    --link-color-dark: #f3daa6;
+                    --link-hover-dark: #ffe8bf;
                     --bs-dark-rgb: 28, 36, 41 !important;
                     --bs-bg-opacity: 1;
+                }
+
+                html[data-bs-theme="dark"] {
+                    --bs-nav-link-color: #f3daa6;
+                    --bs-nav-link-hover-color: #ffe8bf;
+                    --bs-link-color: #f3daa6;
+                    --bs-link-hover-color: #ffe8bf;
+                }
+
+                .theme-dark .nav {
+                    --bs-nav-link-color: #f3daa6;
+                    --bs-nav-link-hover-color: #ffe8bf;
                 }
 
                 body.theme-dark {
@@ -4908,13 +5074,46 @@ function fm_show_header_login()
                     color: #CFD8DC;
                 }
 
+                .theme-dark .card,
+                .theme-dark .modal-content,
+                .theme-dark .dropdown-menu,
+                .theme-dark .table,
+                .theme-dark .list-group-item,
+                .theme-dark .input-group-text {
+                    background-color: #25313a;
+                    color: #CFD8DC;
+                    border-color: #3b4954;
+                }
+
+                .theme-dark .card-header,
+                .theme-dark .card-body,
+                .theme-dark .card-footer,
+                .theme-dark .modal-header,
+                .theme-dark .modal-body,
+                .theme-dark .modal-footer {
+                    background-color: #25313a;
+                    color: #CFD8DC;
+                    border-color: #3b4954;
+                }
+
+                .theme-dark label,
+                .theme-dark .col-form-label,
+                .theme-dark .form-check-label,
+                .theme-dark .text-body-secondary,
+                .theme-dark .dropdown-item,
+                .theme-dark .modal-title,
+                .theme-dark td,
+                .theme-dark th {
+                    color: #CFD8DC !important;
+                }
+
                 .list-group .list-group-item {
                     background: #343a40;
                 }
 
                 .theme-dark .navbar-nav i,
-                .navbar-nav .dropdown-toggle,
-                .break-word {
+                .theme-dark .navbar-nav .dropdown-toggle,
+                .theme-dark .break-word {
                     color: #CFD8DC;
                 }
 
@@ -4925,7 +5124,7 @@ function fm_show_header_login()
                 #main-table .filename a,
                 i.fa.fa-folder-o,
                 i.go-back {
-                    color: var(--bg-color);
+                    color: var(--link-color-dark);
                 }
 
                 ul#search-wrapper li:nth-child(odd) {
@@ -4947,6 +5146,27 @@ function fm_show_header_login()
                     color: #CFD8DC;
                 }
 
+                .theme-dark .form-control,
+                .theme-dark .form-select {
+                    background-color: #101518;
+                    color: #CFD8DC;
+                    border-color: #45525d;
+                }
+
+                .theme-dark .form-control:focus,
+                .theme-dark .form-select:focus {
+                    background-color: #101518;
+                    color: #CFD8DC;
+                    border-color: #80bdff;
+                    box-shadow: 0 0 0 .2rem rgba(0, 123, 255, .25);
+                }
+
+                .theme-dark .dropdown-item:hover,
+                .theme-dark .dropdown-item:focus {
+                    background-color: #1d2730;
+                    color: #CFD8DC !important;
+                }
+
                 .theme-dark .dropzone {
                     background: transparent;
                 }
@@ -4960,7 +5180,7 @@ function fm_show_header_login()
                 }
 
                 .theme-dark .table-bordered td,
-                .table-bordered th {
+                .theme-dark .table-bordered th {
                     border-color: #343434;
                 }
 
@@ -4969,12 +5189,96 @@ function fm_show_header_login()
                     opacity: 0.678;
                 }
 
+                .theme-dark .main-nav {
+                    background: #1f2a30;
+                    --bs-navbar-color: #d4dde4;
+                    --bs-navbar-hover-color: #ffffff;
+                    --bs-navbar-active-color: #ffffff;
+                    --bs-navbar-brand-color: #eef4f8;
+                    --bs-navbar-brand-hover-color: #ffffff;
+                    --bs-navbar-toggler-border-color: #5a6a77;
+                    --bs-nav-link-color: #f3daa6;
+                    --bs-nav-link-hover-color: #ffe8bf;
+                }
+
+                .theme-dark .main-nav .navbar-brand,
+                .theme-dark .main-nav .nav-link,
+                .theme-dark .main-nav .navbar-nav .nav-link,
+                .theme-dark .main-nav .navbar-nav .dropdown-toggle,
+                .theme-dark .main-nav .navbar-nav i {
+                    color: #f3daa6 !important;
+                }
+
+                .theme-dark .nav-link {
+                    color: var(--bs-nav-link-color) !important;
+                }
+
+                .theme-dark .nav-link:hover,
+                .theme-dark .nav-link:focus,
+                .theme-dark .nav-link.active {
+                    color: var(--bs-nav-link-hover-color) !important;
+                }
+
+                .theme-dark .nav-link.active,
+                .theme-dark .nav-tabs .nav-link.active,
+                .theme-dark .nav-pills .nav-link.active {
+                    background-color: #2a3741 !important;
+                    border-color: #4a5a67 !important;
+                    color: #ffe8bf !important;
+                }
+
+                .theme-dark .main-nav .navbar-brand:hover,
+                .theme-dark .main-nav .nav-link:hover,
+                .theme-dark .main-nav .navbar-nav .dropdown-toggle:hover {
+                    color: #ffffff !important;
+                }
+
+                .theme-dark .main-nav .navbar-toggler-icon {
+                    filter: brightness(2.2);
+                }
+
+                .theme-dark .main-nav .input-group-text {
+                    background-color: #2a3741;
+                    color: #d4dde4;
+                    border-color: #4a5a67;
+                }
+
+                .theme-dark .main-nav .form-control,
+                .theme-dark .main-nav .form-control::placeholder {
+                    color: #d4dde4;
+                }
+
+                .theme-dark .main-nav .form-control {
+                    background-color: #182127;
+                    border-color: #4a5a67;
+                }
+
+                .theme-dark .main-nav .dropdown-menu .dropdown-item {
+                    color: #d4dde4 !important;
+                }
+
+                .theme-dark .main-nav .dropdown-menu .dropdown-item:hover {
+                    background-color: #1c2630;
+                    color: #ffffff !important;
+                }
+
+                .theme-dark #main-table tr.even {
+                    background-color: #202a30;
+                }
+
                 .message {
                     background-color: #212529;
                 }
 
                 form.dropzone {
                     border-color: #79755e;
+                }
+
+                .theme-dark .text-muted,
+                .theme-dark .text-body-secondary,
+                .theme-dark small,
+                .theme-dark .btn-link {
+                    color: #b9c4cc !important;
                 }
             </style>
         <?php endif; ?>
@@ -5166,11 +5470,20 @@ function fm_show_header_login()
             // Toast message
             function toast(txt) {
                 var x = document.getElementById("snackbar");
-                x.innerHTML = txt;
+                x.textContent = String(txt);
                 x.className = "show";
                 setTimeout(function() {
                     x.className = x.className.replace("show", "");
                 }, 3000);
+            }
+
+            function escapeHtml(value) {
+                return String(value)
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;")
+                    .replace(/'/g, "&#039;");
             }
 
             // Save file
@@ -5200,7 +5513,7 @@ function fm_show_header_login()
                                 toast("Error: try again");
                             },
                             error: function(mes) {
-                                toast(`<p style="background-color:red">${mes.responseText}</p>`);
+                                toast(mes.responseText || "Error: try again");
                             }
                         });
                     } else {
@@ -5230,8 +5543,28 @@ function fm_show_header_login()
                     url: form.attr('action'),
                     data: form.serialize() + "&token=" + window.csrf + "&ajax=" + true,
                     success: function(data) {
-                        if (data) {
+                        let payload = data;
+                        if (typeof payload === "string") {
+                            try {
+                                payload = JSON.parse(payload);
+                            } catch (e) {
+                                payload = {
+                                    status: "ok"
+                                };
+                            }
+                        }
+                        if (payload && payload.status === "ok") {
                             window.location.reload();
+                        } else {
+                            toast((payload && payload.message) ? payload.message : "Unable to save settings");
+                        }
+                    },
+                    error: function(xhr) {
+                        try {
+                            const payload = JSON.parse(xhr.responseText);
+                            toast(payload.message || "Unable to save settings");
+                        } catch (e) {
+                            toast("Unable to save settings");
                         }
                     }
                 });
@@ -5273,10 +5606,10 @@ function fm_show_header_login()
                         if (data) {
                             data = JSON.parse(data);
                             if (data.done) {
-                                resultWrapper.append('<div class="alert alert-success row">Uploaded Successful: ' + data.done.name + '</div>');
+                                resultWrapper.append('<div class="alert alert-success row">Uploaded Successful: ' + escapeHtml(data.done.name) + '</div>');
                                 form.find("input[name=uploadurl]").val('');
                             } else if (data['fail']) {
-                                resultWrapper.append('<div class="alert alert-danger row">Error: ' + data.fail.message + '</div>');
+                                resultWrapper.append('<div class="alert alert-danger row">Error: ' + escapeHtml(data.fail.message) + '</div>');
                             }
                             form.find("input[name=uploadurl]").removeAttr("disabled");
                             form.find("button").show();
@@ -5297,7 +5630,9 @@ function fm_show_header_login()
             function search_template(data) {
                 var response = "";
                 $.each(data, function(key, val) {
-                    response += `<li><a href="?p=${val.path}&view=${val.name}">${val.path}/${val.name}</a></li>`;
+                    const safePath = encodeURIComponent(val.path);
+                    const safeName = encodeURIComponent(val.name);
+                    response += `<li><a href="?p=${safePath}&view=${safeName}">${escapeHtml(val.path)}/${escapeHtml(val.name)}</a></li>`;
                 });
                 return response;
             }
@@ -5866,6 +6201,7 @@ function fm_show_header_login()
         $tr['en']['Delete selected files and folders?']             = 'Delete selected files and folders?';
         $tr['en']['Search file in folder and subfolders...']        = 'Search file in folder and subfolders...';
         $tr['en']['Access denied']                                  = 'Access denied';
+        $tr['en']['Unable to save settings']                        = 'Unable to save settings';
         $tr['en']['Access denied. IP restriction applicable']       = 'Access denied. IP restriction applicable';
         $tr['en']['Invalid characters in file or folder name']      = 'Invalid characters in file or folder name';
         $tr['en']['Operations with archives are not available']     = 'Operations with archives are not available';
