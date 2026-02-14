@@ -150,6 +150,9 @@ if (is_readable($config_file)) {
     @include($config_file);
 }
 
+// Optional: force https when behind a proxy that does not set HTTPS/X-Forwarded-Proto.
+$force_https = isset($force_https) ? (bool)$force_https : false;
+
 // External CDN resources that can be used in the HTML (replace for GDPR compliance)
 $external = array(
     'css-bootstrap' => '<link href="assets/css/bootstrap.min.css" rel="stylesheet">',
@@ -257,7 +260,8 @@ if (empty($auth_users)) {
 }
 
 $is_https = isset($_SERVER['HTTPS']) && (strtolower($_SERVER['HTTPS']) == 'on' || $_SERVER['HTTPS'] == 1)
-    || isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] == 'https';
+    || isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] == 'https'
+    || $force_https;
 
 // update $root_url based on user specific directories
 if (isset($_SESSION[FM_SESSION_ID]['logged']) && !empty($directories_users[$_SESSION[FM_SESSION_ID]['logged']])) {
