@@ -85,6 +85,9 @@ $iconv_input_encoding = 'UTF-8';
 // Doc - https://www.php.net/manual/en/function.date.php
 $datetime_format = 'm/d/Y g:i A';
 
+// Settings persistence mode: 'file' or 'localstorage'
+$settings_storage = 'file';
+
 // Path display mode when viewing file information
 // 'full' => show full path
 // 'relative' => show path relative to root_path
@@ -192,6 +195,8 @@ if (!defined('FM_SESSION_ID')) {
 
 // Configuration
 $cfg = new FM_Config();
+
+defined('FM_SETTINGS_STORAGE') || define('FM_SETTINGS_STORAGE', ($settings_storage === 'localstorage') ? 'localstorage' : 'file');
 
 // Default language
 $lang = isset($cfg->data['lang']) ? $cfg->data['lang'] : 'en';
@@ -302,6 +307,10 @@ defined('FM_SELF_URL') || define('FM_SELF_URL', ($is_https ? 'https' : 'http') .
 if (isset($_GET['logout'])) {
     unset($_SESSION[FM_SESSION_ID]['logged']);
     unset($_SESSION['token']);
+    if (isset($_COOKIE['tfm_cfg'])) {
+        setcookie('tfm_cfg', '', time() - 3600, '/');
+        unset($_COOKIE['tfm_cfg']);
+    }
     fm_redirect(FM_SELF_URL);
 }
 
@@ -792,7 +801,7 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
         if (!has_permission('can_change_settings')) {
             fm_deny_access(true);
         }
-        global $cfg, $lang, $report_errors, $show_hidden_files, $lang_list, $hide_Cols, $theme;
+        global $cfg, $lang, $report_errors, $show_hidden_files, $lang_list, $hide_Cols, $theme, $settings_storage;
         $newLng = $_POST['js-language'];
         fm_get_translations([]);
         if (!array_key_exists($newLng, $lang_list)) {
@@ -828,6 +837,13 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
             $cfg->data['theme'] = $te3;
             $theme = $te3;
         }
+
+        if ($settings_storage === 'localstorage') {
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode(array('status' => 'ok', 'storage' => 'localstorage'));
+            exit();
+        }
+
         $save_ok = $cfg->save();
         header('Content-Type: application/json; charset=utf-8');
         if ($save_ok) {
@@ -4069,12 +4085,14 @@ class FM_Config
 
     function __construct()
     {
-        global $root_path, $root_url, $CONFIG;
+        global $root_path, $root_url, $CONFIG, $settings_storage;
         $fm_url = $root_url . $_SERVER["PHP_SELF"];
         $this->data = array(
             'lang' => 'en',
             'error_reporting' => true,
-            'show_hidden' => true
+            'show_hidden' => true,
+            'hide_Cols' => true,
+            'theme' => 'light',
         );
         $data = false;
         if (strlen($CONFIG)) {
@@ -4089,8 +4107,33 @@ class FM_Config
             }
             die($msg);
         }
-        if (is_array($data) && count($data)) $this->data = $data;
-        else $this->save();
+        if (is_array($data) && count($data)) {
+            $this->data = $data;
+        } else {
+            $this->save();
+        }
+
+        if ($settings_storage === 'localstorage' && !empty($_COOKIE['tfm_cfg'])) {
+            $cookie_data = json_decode($_COOKIE['tfm_cfg'], true);
+            if (is_array($cookie_data)) {
+                $allowed_themes = array('light', 'dark');
+                if (!empty($cookie_data['lang']) && is_string($cookie_data['lang'])) {
+                    $this->data['lang'] = preg_replace('/[^a-z_]/i', '', $cookie_data['lang']);
+                }
+                if (isset($cookie_data['error_reporting'])) {
+                    $this->data['error_reporting'] = (bool)$cookie_data['error_reporting'];
+                }
+                if (isset($cookie_data['show_hidden'])) {
+                    $this->data['show_hidden'] = (bool)$cookie_data['show_hidden'];
+                }
+                if (isset($cookie_data['hide_Cols'])) {
+                    $this->data['hide_Cols'] = (bool)$cookie_data['hide_Cols'];
+                }
+                if (!empty($cookie_data['theme']) && in_array($cookie_data['theme'], $allowed_themes, true)) {
+                    $this->data['theme'] = $cookie_data['theme'];
+                }
+            }
+        }
     }
 
     function save()
@@ -4208,7 +4251,7 @@ function fm_show_nav_path($path)
                                     <a title="<?php echo lng('Settings') ?>" class="dropdown-item nav-link" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;settings=1"><i class="fa fa-cog" aria-hidden="true"></i> <?php echo lng('Settings') ?></a>
                                 <?php endif ?>
                                 <a title="<?php echo lng('Help') ?>" class="dropdown-item nav-link" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;help=2"><i class="fa fa-exclamation-circle" aria-hidden="true"></i> <?php echo lng('Help') ?></a>
-                                <a title="<?php echo lng('Logout') ?>" class="dropdown-item nav-link" href="?logout=1"><i class="fa fa-sign-out" aria-hidden="true"></i> <?php echo lng('Logout') ?></a>
+                                <a title="<?php echo lng('Logout') ?>" class="dropdown-item nav-link" href="?logout=1" onclick="return tfm_logout(this.href);"><i class="fa fa-sign-out" aria-hidden="true"></i> <?php echo lng('Logout') ?></a>
                             </div>
                         </li>
                     <?php else: ?>
@@ -4432,6 +4475,19 @@ function fm_show_header_login()
         <?php endif; ?>
         <script type="text/javascript">
             window.csrf = '<?php echo $_SESSION['token']; ?>';
+            window.settingsStorage = '<?php echo FM_SETTINGS_STORAGE; ?>';
+            (function() {
+                if (window.settingsStorage !== 'localstorage') {
+                    return;
+                }
+                try {
+                    var hasLocalCfg = !!localStorage.getItem('tfm_cfg');
+                    var hasCookieCfg = document.cookie.indexOf('tfm_cfg=') !== -1;
+                    if (!hasLocalCfg && hasCookieCfg) {
+                        document.cookie = "tfm_cfg=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
+                    }
+                } catch (e) {}
+            })();
         </script>
         <style>
             html {
@@ -5535,9 +5591,56 @@ function fm_show_header_login()
                 $(".js-new-pwd").toggleClass('hidden');
             }
 
+            function settings_from_form($form) {
+                return {
+                    lang: $form.find('[name="js-language"]').val() || "en",
+                    error_reporting: $form.find('[name="js-error-report"]').is(':checked'),
+                    show_hidden: $form.find('[name="js-show-hidden"]').is(':checked'),
+                    hide_Cols: $form.find('[name="js-hide-cols"]').is(':checked'),
+                    theme: $form.find('[name="js-theme-3"]').val() || "light"
+                };
+            }
+
+            function persist_local_settings(settings) {
+                try {
+                    const payload = JSON.stringify(settings);
+                    localStorage.setItem("tfm_cfg", payload);
+                    document.cookie = "tfm_cfg=" + encodeURIComponent(payload) + "; path=/; max-age=31536000; SameSite=Lax";
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            }
+
+            function clear_local_settings() {
+                try {
+                    localStorage.removeItem("tfm_cfg");
+                } catch (e) {}
+                document.cookie = "tfm_cfg=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
+            }
+
+            function tfm_logout(url) {
+                if (window.settingsStorage === "localstorage") {
+                    clear_local_settings();
+                }
+                window.location.href = url;
+                return false;
+            }
+
             // Save Settings
             function save_settings($this) {
                 let form = $($this);
+
+                if (window.settingsStorage === "localstorage") {
+                    const settings = settings_from_form(form);
+                    if (persist_local_settings(settings)) {
+                        window.location.reload();
+                    } else {
+                        toast("Unable to save settings");
+                    }
+                    return false;
+                }
+
                 $.ajax({
                     type: form.attr('method'),
                     url: form.attr('action'),
