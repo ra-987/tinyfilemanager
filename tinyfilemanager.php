@@ -37,6 +37,13 @@ $readonly_users = array(
     'user'
 );
 
+// Granular user permissions
+// array(
+//   'admin' => array('can_browse' => true, ...),
+//   'user' => array('can_browse' => true, 'can_view' => true, 'can_download' => true)
+// )
+$auth_permissions = array();
+
 // Global readonly, including when auth is not being used
 $global_readonly = false;
 
@@ -265,8 +272,21 @@ $is_https = isset($_SERVER['HTTPS']) && (strtolower($_SERVER['HTTPS']) == 'on' |
 
 // update $root_url based on user specific directories
 if (isset($_SESSION[FM_SESSION_ID]['logged']) && !empty($directories_users[$_SESSION[FM_SESSION_ID]['logged']])) {
-    $wd = fm_clean_path(dirname($_SERVER['PHP_SELF']));
-    $root_url =  $root_url . $wd . DIRECTORY_SEPARATOR . $directories_users[$_SESSION[FM_SESSION_ID]['logged']];
+    $user_dir = fm_clean_path($directories_users[$_SESSION[FM_SESSION_ID]['logged']]);
+    $doc_root = fm_clean_path(str_replace('\\', '/', rtrim($_SERVER['DOCUMENT_ROOT'], '\\/')));
+    $user_dir_on_docroot = fm_clean_path($doc_root . '/' . ltrim($user_dir, '/'));
+
+    if (!empty($root_url)) {
+        // explicit root_url from config: append user dir relative to it
+        $root_url = fm_clean_path(trim($root_url, '/') . '/' . ltrim($user_dir, '/'));
+    } elseif (@is_dir($user_dir_on_docroot)) {
+        // preferred mode: user dir is relative to document root
+        $root_url = ltrim($user_dir, '/');
+    } else {
+        // fallback for legacy setups where user dir is relative to script directory
+        $wd = fm_clean_path(dirname($_SERVER['PHP_SELF']));
+        $root_url = fm_clean_path($wd . '/' . ltrim($user_dir, '/'));
+    }
 }
 // clean $root_url
 $root_url = fm_clean_path($root_url);
@@ -433,6 +453,122 @@ defined('FM_DOC_VIEWER') || define('FM_DOC_VIEWER', $online_viewer);
 define('FM_READONLY', $global_readonly || ($use_auth && !empty($readonly_users) && isset($_SESSION[FM_SESSION_ID]['logged']) && in_array($_SESSION[FM_SESSION_ID]['logged'], $readonly_users)));
 define('FM_IS_WIN', DIRECTORY_SEPARATOR == '\\');
 
+function fm_all_permissions()
+{
+    return array(
+        'can_browse' => true,
+        'can_view' => true,
+        'can_download' => true,
+        'can_show_link' => true,
+        'can_search' => true,
+        'can_upload' => true,
+        'can_upload_url' => true,
+        'can_create' => true,
+        'can_edit' => true,
+        'can_rename' => true,
+        'can_delete' => true,
+        'can_copy' => true,
+        'can_move' => true,
+        'can_chmod' => true,
+        'can_zip' => true,
+        'can_tar' => true,
+        'can_unzip' => true,
+        'can_change_settings' => true,
+        'can_pwdhash' => true,
+    );
+}
+
+function fm_readonly_permissions()
+{
+    $permissions = array_fill_keys(array_keys(fm_all_permissions()), false);
+    $permissions['can_browse'] = true;
+    $permissions['can_view'] = true;
+    $permissions['can_download'] = true;
+    $permissions['can_search'] = true;
+    return $permissions;
+}
+
+function fm_normalize_permissions($permissions, $base_permissions = null)
+{
+    $normalized = is_array($base_permissions)
+        ? $base_permissions
+        : array_fill_keys(array_keys(fm_all_permissions()), false);
+
+    if (!is_array($permissions)) {
+        return $normalized;
+    }
+
+    foreach ($normalized as $key => $value) {
+        if (array_key_exists($key, $permissions)) {
+            $normalized[$key] = (bool)$permissions[$key];
+        }
+    }
+
+    return $normalized;
+}
+
+function fm_current_user()
+{
+    return isset($_SESSION[FM_SESSION_ID]['logged']) ? $_SESSION[FM_SESSION_ID]['logged'] : null;
+}
+
+function fm_resolve_permissions()
+{
+    global $auth_permissions, $readonly_users, $global_readonly;
+    static $resolved = null;
+
+    if ($resolved !== null) {
+        return $resolved;
+    }
+
+    $admin_permissions = fm_all_permissions();
+    $readonly_permissions = fm_readonly_permissions();
+    $current_user = fm_current_user();
+    $has_granular_permissions = is_array($auth_permissions) && !empty($auth_permissions);
+
+    if ($has_granular_permissions && $current_user !== null && isset($auth_permissions[$current_user])) {
+        $resolved = fm_normalize_permissions($auth_permissions[$current_user]);
+        return $resolved;
+    }
+
+    if ($global_readonly || ($current_user !== null && !empty($readonly_users) && in_array($current_user, $readonly_users, true))) {
+        $resolved = $readonly_permissions;
+        return $resolved;
+    }
+
+    $resolved = $admin_permissions;
+    return $resolved;
+}
+
+function has_permission($action)
+{
+    $permissions = fm_resolve_permissions();
+    return isset($permissions[$action]) ? (bool)$permissions[$action] : false;
+}
+
+function has_any_permission($actions)
+{
+    foreach ($actions as $action) {
+        if (has_permission($action)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function fm_deny_access($is_ajax = false)
+{
+    fm_set_msg(lng('Access denied'), 'error');
+    if ($is_ajax) {
+        header('HTTP/1.1 403 Forbidden');
+        echo json_encode(array('status' => 'error', 'info' => lng('Access denied')));
+    } else {
+        $FM_PATH = FM_PATH;
+        fm_redirect(FM_SELF_URL . '?p=' . urlencode($FM_PATH));
+    }
+    exit;
+}
+
 // always use ?p=
 if (!isset($_GET['p']) && empty($_FILES)) {
     fm_redirect(FM_SELF_URL . '?p=');
@@ -470,18 +606,20 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
 
     //search : get list of files from the current folder
     if (isset($_POST['type']) && $_POST['type'] == "search") {
+        if (!has_permission('can_search')) {
+            fm_deny_access(true);
+        }
         $dir = $_POST['path'] == "." ? '' : $_POST['path'];
         $response = scan(fm_clean_path($dir), $_POST['content']);
         echo json_encode($response);
         exit();
     }
 
-    if(FM_READONLY){
-        exit();
-    }
-
     // save editor file
     if (isset($_POST['type']) && $_POST['type'] == "save") {
+        if (!has_permission('can_edit')) {
+            fm_deny_access(true);
+        }
         // get current path
         $path = FM_ROOT_PATH;
         if (FM_PATH != '') {
@@ -515,6 +653,9 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
 
     // backup files
     if (isset($_POST['type']) && $_POST['type'] == "backup" && !empty($_POST['file'])) {
+        if (!has_permission('can_edit')) {
+            fm_deny_access(true);
+        }
         $fileName = fm_clean_path($_POST['file']);
         $fullPath = FM_ROOT_PATH . '/';
         if (!empty($_POST['path'])) {
@@ -540,6 +681,9 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
 
     // Save Config
     if (isset($_POST['type']) && $_POST['type'] == "settings") {
+        if (!has_permission('can_change_settings')) {
+            fm_deny_access(true);
+        }
         global $cfg, $lang, $report_errors, $show_hidden_files, $lang_list, $hide_Cols, $theme;
         $newLng = $_POST['js-language'];
         fm_get_translations([]);
@@ -582,12 +726,18 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
 
     // new password hash
     if (isset($_POST['type']) && $_POST['type'] == "pwdhash") {
+        if (!has_permission('can_pwdhash')) {
+            fm_deny_access(true);
+        }
         $res = isset($_POST['inputPassword2']) && !empty($_POST['inputPassword2']) ? password_hash($_POST['inputPassword2'], PASSWORD_DEFAULT) : '';
         echo $res;
     }
 
     //upload using url
     if (isset($_POST['type']) && $_POST['type'] == "upload" && !empty($_REQUEST["uploadurl"])) {
+        if (!has_permission('can_upload_url')) {
+            fm_deny_access(true);
+        }
         $path = FM_ROOT_PATH;
         if (FM_PATH != '') {
             $path .= '/' . FM_PATH;
@@ -678,7 +828,10 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
 }
 
 // Delete file / folder
-if (isset($_GET['del'], $_POST['token']) && !FM_READONLY) {
+if (isset($_GET['del'], $_POST['token'])) {
+    if (!has_permission('can_delete')) {
+        fm_deny_access();
+    }
     $del = str_replace('/', '', fm_clean_path($_GET['del']));
     if ($del != '' && $del != '..' && $del != '.' && verifyToken($_POST['token'])) {
         $path = FM_ROOT_PATH;
@@ -701,7 +854,10 @@ if (isset($_GET['del'], $_POST['token']) && !FM_READONLY) {
 }
 
 // Create a new file/folder
-if (isset($_POST['newfilename'], $_POST['newfile'], $_POST['token']) && !FM_READONLY) {
+if (isset($_POST['newfilename'], $_POST['newfile'], $_POST['token'])) {
+    if (!has_permission('can_create')) {
+        fm_deny_access();
+    }
     $type = urldecode($_POST['newfile']);
     $new = str_replace('/', '', fm_clean_path(strip_tags($_POST['newfilename'])));
     if (fm_isvalid_filename($new) && $new != '' && $new != '..' && $new != '.' && verifyToken($_POST['token'])) {
@@ -737,7 +893,7 @@ if (isset($_POST['newfilename'], $_POST['newfile'], $_POST['token']) && !FM_READ
 }
 
 // Copy folder / file
-if (isset($_GET['copy'], $_GET['finish']) && !FM_READONLY) {
+if (isset($_GET['copy'], $_GET['finish'])) {
     // from
     $copy = urldecode($_GET['copy']);
     $copy = fm_clean_path($copy);
@@ -758,6 +914,12 @@ if (isset($_GET['copy'], $_GET['finish']) && !FM_READONLY) {
     // move?
     $move = isset($_GET['move']);
     $move = fm_clean_path(urldecode($move));
+    if ($move && !has_permission('can_move')) {
+        fm_deny_access();
+    }
+    if (!$move && !has_permission('can_copy')) {
+        fm_deny_access();
+    }
     // copy/move/duplicate
     if ($from != $dest) {
         $msg_from = trim(FM_PATH . '/' . basename($from), '/');
@@ -809,7 +971,7 @@ if (isset($_GET['copy'], $_GET['finish']) && !FM_READONLY) {
 }
 
 // Mass copy files/ folders
-if (isset($_POST['file'], $_POST['copy_to'], $_POST['finish'], $_POST['token']) && !FM_READONLY) {
+if (isset($_POST['file'], $_POST['copy_to'], $_POST['finish'], $_POST['token'])) {
 
     if (!verifyToken($_POST['token'])) {
         fm_set_msg(lng('Invalid Token.'), 'error');
@@ -841,6 +1003,12 @@ if (isset($_POST['file'], $_POST['copy_to'], $_POST['finish'], $_POST['token']) 
     }
     // move?
     $move = isset($_POST['move']);
+    if ($move && !has_permission('can_move')) {
+        fm_deny_access();
+    }
+    if (!$move && !has_permission('can_copy')) {
+        fm_deny_access();
+    }
     // copy/move
     $errors = 0;
     $files = $_POST['file'];
@@ -880,7 +1048,10 @@ if (isset($_POST['file'], $_POST['copy_to'], $_POST['finish'], $_POST['token']) 
 }
 
 // Rename
-if (isset($_POST['rename_from'], $_POST['rename_to'], $_POST['token']) && !FM_READONLY) {
+if (isset($_POST['rename_from'], $_POST['rename_to'], $_POST['token'])) {
+    if (!has_permission('can_rename')) {
+        fm_deny_access();
+    }
     if (!verifyToken($_POST['token'])) {
         fm_set_msg("Invalid Token.", 'error');
         die("Invalid Token.");
@@ -914,6 +1085,9 @@ if (isset($_POST['rename_from'], $_POST['rename_to'], $_POST['token']) && !FM_RE
 
 // Download
 if (isset($_GET['dl'], $_POST['token'])) {
+    if (!has_permission('can_download')) {
+        fm_deny_access();
+    }
     // Verify the token to ensure it's valid
     if (!verifyToken($_POST['token'])) {
         fm_set_msg("Invalid Token.", 'error');
@@ -950,7 +1124,10 @@ if (isset($_GET['dl'], $_POST['token'])) {
 }
 
 // Upload
-if (!empty($_FILES) && !FM_READONLY) {
+if (!empty($_FILES)) {
+    if (!has_permission('can_upload')) {
+        fm_deny_access(true);
+    }
     if (isset($_POST['token'])) {
         if (!verifyToken($_POST['token'])) {
             $response = array('status' => 'error', 'info' => "Invalid Token.");
@@ -1094,7 +1271,10 @@ if (!empty($_FILES) && !FM_READONLY) {
 }
 
 // Mass deleting
-if (isset($_POST['group'], $_POST['delete'], $_POST['token']) && !FM_READONLY) {
+if (isset($_POST['group'], $_POST['delete'], $_POST['token'])) {
+    if (!has_permission('can_delete')) {
+        fm_deny_access();
+    }
 
     if (!verifyToken($_POST['token'])) {
         fm_set_msg(lng("Invalid Token."), 'error');
@@ -1131,7 +1311,10 @@ if (isset($_POST['group'], $_POST['delete'], $_POST['token']) && !FM_READONLY) {
 }
 
 // Pack files zip, tar
-if (isset($_POST['group'], $_POST['token']) && (isset($_POST['zip']) || isset($_POST['tar'])) && !FM_READONLY) {
+if (isset($_POST['group'], $_POST['token']) && (isset($_POST['zip']) || isset($_POST['tar']))) {
+    if ((isset($_POST['zip']) && !has_permission('can_zip')) || (isset($_POST['tar']) && !has_permission('can_tar'))) {
+        fm_deny_access();
+    }
 
     if (!verifyToken($_POST['token'])) {
         fm_set_msg(lng("Invalid Token."), 'error');
@@ -1196,7 +1379,10 @@ if (isset($_POST['group'], $_POST['token']) && (isset($_POST['zip']) || isset($_
 }
 
 // Unpack zip, tar
-if (isset($_POST['unzip'], $_POST['token']) && !FM_READONLY) {
+if (isset($_POST['unzip'], $_POST['token'])) {
+    if (!has_permission('can_unzip')) {
+        fm_deny_access();
+    }
 
     if (!verifyToken($_POST['token'])) {
         fm_set_msg(lng("Invalid Token."), 'error');
@@ -1267,7 +1453,10 @@ if (isset($_POST['unzip'], $_POST['token']) && !FM_READONLY) {
 }
 
 // Change Perms (not for Windows)
-if (isset($_POST['chmod'], $_POST['token']) && !FM_READONLY && !FM_IS_WIN) {
+if (isset($_POST['chmod'], $_POST['token']) && !FM_IS_WIN) {
+    if (!has_permission('can_chmod')) {
+        fm_deny_access();
+    }
 
     if (!verifyToken($_POST['token'])) {
         fm_set_msg(lng("Invalid Token."), 'error');
@@ -1339,6 +1528,30 @@ if (FM_PATH != '') {
 if (!is_dir($path)) {
     fm_redirect(FM_SELF_URL . '?p=');
 }
+if (!has_permission('can_browse')) {
+    fm_deny_access();
+}
+if (isset($_GET['upload']) && !(has_permission('can_upload') || has_permission('can_upload_url'))) {
+    fm_deny_access();
+}
+if (isset($_POST['copy']) && !(has_permission('can_copy') || has_permission('can_move'))) {
+    fm_deny_access();
+}
+if (isset($_GET['copy']) && !isset($_GET['finish']) && !(has_permission('can_copy') || has_permission('can_move'))) {
+    fm_deny_access();
+}
+if (isset($_GET['settings']) && !has_permission('can_change_settings')) {
+    fm_deny_access();
+}
+if (isset($_GET['edit']) && !has_permission('can_edit')) {
+    fm_deny_access();
+}
+if (isset($_GET['chmod']) && !has_permission('can_chmod')) {
+    fm_deny_access();
+}
+if (isset($_GET['view']) && !has_permission('can_view')) {
+    fm_deny_access();
+}
 
 // get parent folder
 $parent = fm_get_parent_path(FM_PATH);
@@ -1372,7 +1585,7 @@ if (!empty($folders)) {
 }
 
 // upload form
-if (isset($_GET['upload']) && !FM_READONLY) {
+if (isset($_GET['upload']) && (has_permission('can_upload') || has_permission('can_upload_url'))) {
     fm_show_header(); // HEADER
     fm_show_nav_path(FM_PATH); // current path
     //get the allowed file extensions
@@ -1394,12 +1607,16 @@ if (isset($_GET['upload']) && !FM_READONLY) {
         <div class="card mb-2 fm-upload-wrapper" data-bs-theme="<?php echo FM_THEME; ?>">
             <div class="card-header">
                 <ul class="nav nav-tabs card-header-tabs">
-                    <li class="nav-item">
-                        <a class="nav-link active" href="#fileUploader" data-target="#fileUploader"><i class="fa fa-arrow-circle-o-up"></i> <?php echo lng('UploadingFiles') ?></a>
-                    </li>
-                    <li class="nav-item">
-                        <a class="nav-link" href="#urlUploader" class="js-url-upload" data-target="#urlUploader"><i class="fa fa-link"></i> <?php echo lng('Upload from URL') ?></a>
-                    </li>
+                    <?php if (has_permission('can_upload')): ?>
+                        <li class="nav-item">
+                            <a class="nav-link <?php echo has_permission('can_upload') ? 'active' : ''; ?>" href="#fileUploader" data-target="#fileUploader"><i class="fa fa-arrow-circle-o-up"></i> <?php echo lng('UploadingFiles') ?></a>
+                        </li>
+                    <?php endif; ?>
+                    <?php if (has_permission('can_upload_url')): ?>
+                        <li class="nav-item">
+                            <a class="nav-link <?php echo has_permission('can_upload') ? '' : 'active'; ?>" href="#urlUploader" class="js-url-upload" data-target="#urlUploader"><i class="fa fa-link"></i> <?php echo lng('Upload from URL') ?></a>
+                        </li>
+                    <?php endif; ?>
                 </ul>
             </div>
             <div class="card-body">
@@ -1408,75 +1625,81 @@ if (isset($_GET['upload']) && !FM_READONLY) {
                     <strong><?php echo lng('DestinationFolder') ?></strong>: <?php echo fm_enc(fm_convert_win(FM_PATH)) ?>
                 </p>
 
-                <form action="<?php echo htmlspecialchars(FM_SELF_URL) . '?p=' . fm_enc(FM_PATH) ?>" class="dropzone card-tabs-container" id="fileUploader" enctype="multipart/form-data">
-                    <input type="hidden" name="p" value="<?php echo fm_enc(FM_PATH) ?>">
-                    <input type="hidden" name="fullpath" id="fullpath" value="<?php echo fm_enc(FM_PATH) ?>">
-                    <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
-                    <div class="fallback">
-                        <input name="file" type="file" multiple />
-                    </div>
-                </form>
-
-                <div class="upload-url-wrapper card-tabs-container hidden" id="urlUploader">
-                    <form id="js-form-url-upload" class="row row-cols-lg-auto g-3 align-items-center" onsubmit="return upload_from_url(this);" method="POST" action="">
-                        <input type="hidden" name="type" value="upload" aria-label="hidden" aria-hidden="true">
-                        <input type="url" placeholder="URL" name="uploadurl" required class="form-control" style="width: 80%">
+                <?php if (has_permission('can_upload')): ?>
+                    <form action="<?php echo htmlspecialchars(FM_SELF_URL) . '?p=' . fm_enc(FM_PATH) ?>" class="dropzone card-tabs-container <?php echo has_permission('can_upload_url') ? '' : 'active'; ?>" id="fileUploader" enctype="multipart/form-data">
+                        <input type="hidden" name="p" value="<?php echo fm_enc(FM_PATH) ?>">
+                        <input type="hidden" name="fullpath" id="fullpath" value="<?php echo fm_enc(FM_PATH) ?>">
                         <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
-                        <button type="submit" class="btn btn-primary ms-3"><?php echo lng('Upload') ?></button>
-                        <div class="lds-facebook">
-                            <div></div>
-                            <div></div>
-                            <div></div>
+                        <div class="fallback">
+                            <input name="file" type="file" multiple />
                         </div>
                     </form>
-                    <div id="js-url-upload__list" class="col-9 mt-3"></div>
-                </div>
+                <?php endif; ?>
+
+                <?php if (has_permission('can_upload_url')): ?>
+                    <div class="upload-url-wrapper card-tabs-container <?php echo has_permission('can_upload') ? 'hidden' : ''; ?>" id="urlUploader">
+                        <form id="js-form-url-upload" class="row row-cols-lg-auto g-3 align-items-center" onsubmit="return upload_from_url(this);" method="POST" action="">
+                            <input type="hidden" name="type" value="upload" aria-label="hidden" aria-hidden="true">
+                            <input type="url" placeholder="URL" name="uploadurl" required class="form-control" style="width: 80%">
+                            <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
+                            <button type="submit" class="btn btn-primary ms-3"><?php echo lng('Upload') ?></button>
+                            <div class="lds-facebook">
+                                <div></div>
+                                <div></div>
+                                <div></div>
+                            </div>
+                        </form>
+                        <div id="js-url-upload__list" class="col-9 mt-3"></div>
+                    </div>
+                <?php endif; ?>
             </div>
         </div>
     </div>
-    <?php print_external('js-dropzone'); ?>
-    <script>
-        Dropzone.options.fileUploader = {
-            chunking: true,
-            chunkSize: <?php echo UPLOAD_CHUNK_SIZE; ?>,
-            forceChunking: true,
-            retryChunks: true,
-            retryChunksLimit: 3,
-            parallelUploads: 1,
-            parallelChunkUploads: false,
-            timeout: 120000,
-            maxFilesize: "<?php echo MAX_UPLOAD_SIZE; ?>",
-            acceptedFiles: "<?php echo getUploadExt() ?>",
-            init: function() {
-                this.on("sending", function(file, xhr, formData) {
-                    let _path = (file.fullPath) ? file.fullPath : file.name;
-                    document.getElementById("fullpath").value = _path;
-                    xhr.ontimeout = (function() {
-                        toast('Error: Server Timeout');
-                    });
-                }).on("success", function(res) {
-                    try {
-                        let _response = JSON.parse(res.xhr.response);
+    <?php if (has_permission('can_upload')): ?>
+        <?php print_external('js-dropzone'); ?>
+        <script>
+            Dropzone.options.fileUploader = {
+                chunking: true,
+                chunkSize: <?php echo UPLOAD_CHUNK_SIZE; ?>,
+                forceChunking: true,
+                retryChunks: true,
+                retryChunksLimit: 3,
+                parallelUploads: 1,
+                parallelChunkUploads: false,
+                timeout: 120000,
+                maxFilesize: "<?php echo MAX_UPLOAD_SIZE; ?>",
+                acceptedFiles: "<?php echo getUploadExt() ?>",
+                init: function() {
+                    this.on("sending", function(file, xhr, formData) {
+                        let _path = (file.fullPath) ? file.fullPath : file.name;
+                        document.getElementById("fullpath").value = _path;
+                        xhr.ontimeout = (function() {
+                            toast('Error: Server Timeout');
+                        });
+                    }).on("success", function(res) {
+                        try {
+                            let _response = JSON.parse(res.xhr.response);
 
-                        if (_response.status == "error") {
-                            toast(_response.info);
+                            if (_response.status == "error") {
+                                toast(_response.info);
+                            }
+                        } catch (e) {
+                            toast("Error: Invalid JSON response");
                         }
-                    } catch (e) {
-                        toast("Error: Invalid JSON response");
-                    }
-                }).on("error", function(file, response) {
-                    toast(response);
-                });
+                    }).on("error", function(file, response) {
+                        toast(response);
+                    });
+                }
             }
-        }
-    </script>
+        </script>
+    <?php endif; ?>
 <?php
     fm_show_footer();
     exit;
 }
 
 // copy form POST
-if (isset($_POST['copy']) && !FM_READONLY) {
+if (isset($_POST['copy']) && (has_permission('can_copy') || has_permission('can_move'))) {
     $copy_files = isset($_POST['file']) ? $_POST['file'] : null;
     if (!is_array($copy_files) || empty($copy_files)) {
         fm_set_msg(lng('Nothing selected'), 'alert');
@@ -1506,13 +1729,17 @@ if (isset($_POST['copy']) && !FM_READONLY) {
                         <label for="inp_copy_to"><strong><?php echo lng('DestinationFolder') ?></strong>:</label>
                         <?php echo FM_ROOT_PATH ?>/<input type="text" name="copy_to" id="inp_copy_to" value="<?php echo fm_enc(FM_PATH) ?>">
                     </p>
-                    <p class="custom-checkbox custom-control"><input type="checkbox" name="move" value="1" id="js-move-files" class="custom-control-input">
-                        <label for="js-move-files" class="custom-control-label ms-2"><?php echo lng('Move') ?></label>
-                    </p>
+                    <?php if (has_permission('can_move') && has_permission('can_copy')): ?>
+                        <p class="custom-checkbox custom-control"><input type="checkbox" name="move" value="1" id="js-move-files" class="custom-control-input">
+                            <label for="js-move-files" class="custom-control-label ms-2"><?php echo lng('Move') ?></label>
+                        </p>
+                    <?php elseif (has_permission('can_move') && !has_permission('can_copy')): ?>
+                        <input type="hidden" name="move" value="1">
+                    <?php endif; ?>
                     <p>
                         <b><a href="?p=<?php echo urlencode(FM_PATH) ?>" class="btn btn-outline-danger"><i class="fa fa-times-circle"></i> <?php echo lng('Cancel') ?></a></b>&nbsp;
                         <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
-                        <button type="submit" class="btn btn-success"><i class="fa fa-check-circle"></i> <?php echo lng('Copy') ?></button>
+                        <button type="submit" class="btn btn-success"><i class="fa fa-check-circle"></i> <?php echo (has_permission('can_move') && !has_permission('can_copy')) ? lng('Move') : lng('Copy') ?></button>
                     </p>
                 </form>
             </div>
@@ -1524,7 +1751,7 @@ if (isset($_POST['copy']) && !FM_READONLY) {
 }
 
 // copy form
-if (isset($_GET['copy']) && !isset($_GET['finish']) && !FM_READONLY) {
+if (isset($_GET['copy']) && !isset($_GET['finish']) && (has_permission('can_copy') || has_permission('can_move'))) {
     $copy = $_GET['copy'];
     $copy = fm_clean_path($copy);
     if ($copy == '' || !file_exists(FM_ROOT_PATH . '/' . $copy)) {
@@ -1543,8 +1770,12 @@ if (isset($_GET['copy']) && !isset($_GET['finish']) && !FM_READONLY) {
             <strong>Destination folder:</strong> <?php echo fm_enc(fm_convert_win(FM_ROOT_PATH . '/' . FM_PATH)) ?>
         </p>
         <p>
-            <b><a href="?p=<?php echo urlencode(FM_PATH) ?>&amp;copy=<?php echo urlencode($copy) ?>&amp;finish=1"><i class="fa fa-check-circle"></i> Copy</a></b> &nbsp;
-            <b><a href="?p=<?php echo urlencode(FM_PATH) ?>&amp;copy=<?php echo urlencode($copy) ?>&amp;finish=1&amp;move=1"><i class="fa fa-check-circle"></i> Move</a></b> &nbsp;
+            <?php if (has_permission('can_copy')): ?>
+                <b><a href="?p=<?php echo urlencode(FM_PATH) ?>&amp;copy=<?php echo urlencode($copy) ?>&amp;finish=1"><i class="fa fa-check-circle"></i> Copy</a></b> &nbsp;
+            <?php endif; ?>
+            <?php if (has_permission('can_move')): ?>
+                <b><a href="?p=<?php echo urlencode(FM_PATH) ?>&amp;copy=<?php echo urlencode($copy) ?>&amp;finish=1&amp;move=1"><i class="fa fa-check-circle"></i> Move</a></b> &nbsp;
+            <?php endif; ?>
             <b><a href="?p=<?php echo urlencode(FM_PATH) ?>" class="text-danger"><i class="fa fa-times-circle"></i> Cancel</a></b>
         </p>
         <p><i><?php echo lng('Select folder') ?></i></p>
@@ -1570,7 +1801,7 @@ if (isset($_GET['copy']) && !isset($_GET['finish']) && !FM_READONLY) {
     exit;
 }
 
-if (isset($_GET['settings']) && !FM_READONLY) {
+if (isset($_GET['settings']) && has_permission('can_change_settings')) {
     fm_show_header(); // HEADER
     fm_show_nav_path(FM_PATH); // current path
     global $cfg, $lang, $lang_list;
@@ -1689,7 +1920,7 @@ if (isset($_GET['help'])) {
                             <ul class="list-group list-group-flush">
                                 <li class="list-group-item"><a href="https://github.com/prasathmani/tinyfilemanager/wiki" target="_blank"><i class="fa fa-question-circle"></i> <?php echo lng('Help Documents') ?> </a> </li>
                                 <li class="list-group-item"><a href="https://github.com/prasathmani/tinyfilemanager/issues" target="_blank"><i class="fa fa-bug"></i> <?php echo lng('Report Issue') ?></a></li>
-                                <?php if (!FM_READONLY) { ?>
+                                <?php if (has_permission('can_pwdhash')) { ?>
                                     <li class="list-group-item"><a href="javascript:show_new_pwd();"><i class="fa fa-lock"></i> <?php echo lng('Generate new password hash') ?></a></li>
                                 <?php } ?>
                             </ul>
@@ -1722,6 +1953,9 @@ if (isset($_GET['help'])) {
 
 // file viewer
 if (isset($_GET['view'])) {
+    if (!has_permission('can_view')) {
+        fm_deny_access();
+    }
     $file = $_GET['view'];
     $file = fm_clean_path($file, false);
     $file = str_replace('/', '', $file);
@@ -1823,17 +2057,21 @@ if (isset($_GET['view'])) {
                 ?>
             </ul>
             <div class="btn-group btn-group-sm flex-wrap" role="group">
-                <form method="post" class="d-inline mb-0 btn btn-outline-primary" action="?p=<?php echo urlencode(FM_PATH) ?>&amp;dl=<?php echo urlencode($file) ?>">
-                    <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
-                    <button type="submit" class="btn btn-link btn-sm text-decoration-none fw-bold p-0"><i class="fa fa-cloud-download"></i> <?php echo lng('Download') ?></button> &nbsp;
-                </form>
-                <?php if (!FM_READONLY): ?>
+                <?php if (has_permission('can_download')): ?>
+                    <form method="post" class="d-inline mb-0 btn btn-outline-primary" action="?p=<?php echo urlencode(FM_PATH) ?>&amp;dl=<?php echo urlencode($file) ?>">
+                        <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
+                        <button type="submit" class="btn btn-link btn-sm text-decoration-none fw-bold p-0"><i class="fa fa-cloud-download"></i> <?php echo lng('Download') ?></button> &nbsp;
+                    </form>
+                <?php endif; ?>
+                <?php if (has_permission('can_delete')): ?>
                     <a class="fw-bold btn btn-outline-primary" title="<?php echo lng('Delete') ?>" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;del=<?php echo urlencode($file) ?>" onclick="confirmDailog(event, 1209, '<?php echo lng('Delete') . ' ' . lng('File'); ?>','<?php echo urlencode($file); ?>', this.href);"> <i class="fa fa-trash"></i> Delete</a>
                 <?php endif; ?>
-                <a class="fw-bold btn btn-outline-primary" href="<?php echo fm_enc($file_url) ?>" target="_blank"><i class="fa fa-external-link-square"></i> <?php echo lng('Open') ?></a></b>
+                <?php if (has_permission('can_show_link')): ?>
+                    <a class="fw-bold btn btn-outline-primary" href="<?php echo fm_enc($file_url) ?>" target="_blank"><i class="fa fa-external-link-square"></i> <?php echo lng('Open') ?></a>
+                <?php endif; ?>
                 <?php
                 // ZIP actions
-                if (!FM_READONLY && ($is_zip || $is_gzip) && $filenames !== false) {
+                if (has_permission('can_unzip') && ($is_zip || $is_gzip) && $filenames !== false) {
                     $zip_name = pathinfo($file_path, PATHINFO_FILENAME);
                 ?>
                     <form method="post" class="d-inline btn btn-outline-primary mb-0">
@@ -1849,7 +2087,7 @@ if (isset($_GET['view'])) {
                     </form>
                 <?php
                 }
-                if ($is_text && !FM_READONLY) {
+                if ($is_text && has_permission('can_edit')) {
                 ?>
                     <a class="fw-bold btn btn-outline-primary" href="?p=<?php echo urlencode(trim(FM_PATH)) ?>&amp;edit=<?php echo urlencode($file) ?>" class="edit-file">
                         <i class="fa fa-pencil-square"></i> <?php echo lng('Edit') ?>
@@ -1927,7 +2165,7 @@ if (isset($_GET['view'])) {
 }
 
 // file editor
-if (isset($_GET['edit']) && !FM_READONLY) {
+if (isset($_GET['edit']) && has_permission('can_edit')) {
     $file = $_GET['edit'];
     $file = fm_clean_path($file, false);
     $file = str_replace('/', '', $file);
@@ -2032,7 +2270,7 @@ if (isset($_GET['edit']) && !FM_READONLY) {
 }
 
 // chmod (not for Windows)
-if (isset($_GET['chmod']) && !FM_READONLY && !FM_IS_WIN) {
+if (isset($_GET['chmod']) && has_permission('can_chmod') && !FM_IS_WIN) {
     $file = $_GET['chmod'];
     $file = fm_clean_path($file);
     $file = str_replace('/', '', $file);
@@ -2115,6 +2353,16 @@ fm_show_message();
 $num_files = count($files);
 $num_folders = count($folders);
 $all_files_size = 0;
+$can_delete = has_permission('can_delete');
+$can_rename = has_permission('can_rename');
+$can_copy = has_permission('can_copy');
+$can_move = has_permission('can_move');
+$can_chmod = has_permission('can_chmod') && !FM_IS_WIN;
+$can_zip = has_permission('can_zip');
+$can_tar = has_permission('can_tar');
+$can_download = has_permission('can_download');
+$can_show_link = has_permission('can_show_link');
+$can_select_items = has_any_permission(array('can_delete', 'can_copy', 'can_move', 'can_zip', 'can_tar'));
 ?>
 <form action="" method="post" class="pt-3">
     <input type="hidden" name="p" value="<?php echo fm_enc(FM_PATH) ?>">
@@ -2124,7 +2372,7 @@ $all_files_size = 0;
         <table class="table table-bordered table-hover table-sm" id="main-table" data-bs-theme="<?php echo FM_THEME; ?>">
             <thead class="thead-white">
                 <tr>
-                    <?php if (!FM_READONLY): ?>
+                    <?php if ($can_select_items): ?>
                         <th style="width:3%" class="custom-checkbox-header">
                             <div class="custom-control custom-checkbox">
                                 <input type="checkbox" class="custom-control-input" id="js-select-all-items" onclick="checkbox_toggle()">
@@ -2144,7 +2392,7 @@ $all_files_size = 0;
             // link to parent folder
             if ($parent !== false) {
             ?>
-                <tr><?php if (!FM_READONLY): ?>
+                <tr><?php if ($can_select_items): ?>
                         <td class="nosort"></td><?php endif; ?>
                     <td class="border-0" data-sort><a href="?p=<?php echo urlencode($parent) ?>"><i class="fa fa-chevron-circle-left go-back"></i> ..</a></td>
                     <td class="border-0" data-order></td>
@@ -2189,7 +2437,7 @@ $all_files_size = 0;
                 }
             ?>
                 <tr>
-                    <?php if (!FM_READONLY): ?>
+                    <?php if ($can_select_items): ?>
                         <td class="custom-checkbox-td">
                             <div class="custom-control custom-checkbox">
                                 <input type="checkbox" class="custom-control-input" id="<?php echo $ii ?>" name="file[]" value="<?php echo fm_enc($f) ?>">
@@ -2209,18 +2457,25 @@ $all_files_size = 0;
                     <td data-order="a-<?php echo $date_sorting; ?>"><?php echo $modif ?></td>
                     <?php if (!FM_IS_WIN && !$hide_Cols): ?>
                         <td>
-                            <?php if (!FM_READONLY): ?><a title="Change Permissions" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;chmod=<?php echo urlencode($f) ?>"><?php echo $perms ?></a><?php else: ?><?php echo $perms ?><?php endif; ?>
+                            <?php if ($can_chmod): ?><a title="Change Permissions" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;chmod=<?php echo urlencode($f) ?>"><?php echo $perms ?></a><?php else: ?><?php echo $perms ?><?php endif; ?>
                         </td>
                         <td>
                             <?php echo $owner['name'] . ':' . $group['name'] ?>
                         </td>
                     <?php endif; ?>
-                    <td class="inline-actions"><?php if (!FM_READONLY): ?>
+                    <td class="inline-actions">
+                        <?php if ($can_delete): ?>
                             <a title="<?php echo lng('Delete') ?>" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;del=<?php echo urlencode($f) ?>" onclick="confirmDailog(event, '1028','<?php echo lng('Delete') . ' ' . lng('Folder'); ?>','<?php echo urlencode($f) ?>', this.href);"> <i class="fa fa-trash-o" aria-hidden="true"></i></a>
+                        <?php endif; ?>
+                        <?php if ($can_rename): ?>
                             <a title="<?php echo lng('Rename') ?>" href="#" onclick="rename('<?php echo fm_enc(addslashes(FM_PATH)) ?>', '<?php echo fm_enc(addslashes($f)) ?>');return false;"><i class="fa fa-pencil-square-o" aria-hidden="true"></i></a>
+                        <?php endif; ?>
+                        <?php if ($can_copy || $can_move): ?>
                             <a title="<?php echo lng('CopyTo') ?>..." href="?p=&amp;copy=<?php echo urlencode(trim(FM_PATH . '/' . $f, '/')) ?>"><i class="fa fa-files-o" aria-hidden="true"></i></a>
                         <?php endif; ?>
-                        <a title="<?php echo lng('DirectLink') ?>" href="<?php echo fm_enc(FM_ROOT_URL . (FM_PATH != '' ? '/' . FM_PATH : '') . '/' . $f . '/') ?>" target="_blank"><i class="fa fa-link" aria-hidden="true"></i></a>
+                        <?php if ($can_show_link): ?>
+                            <a title="<?php echo lng('DirectLink') ?>" href="<?php echo fm_enc(FM_ROOT_URL . (FM_PATH != '' ? '/' . FM_PATH : '') . '/' . $f . '/') ?>" target="_blank"><i class="fa fa-link" aria-hidden="true"></i></a>
+                        <?php endif; ?>
                     </td>
                 </tr>
             <?php
@@ -2261,7 +2516,7 @@ $all_files_size = 0;
                 }
             ?>
                 <tr>
-                    <?php if (!FM_READONLY): ?>
+                    <?php if ($can_select_items): ?>
                         <td class="custom-checkbox-td">
                             <div class="custom-control custom-checkbox">
                                 <input type="checkbox" class="custom-control-input" id="<?php echo $ik ?>" name="file[]" value="<?php echo fm_enc($f) ?>">
@@ -2287,19 +2542,27 @@ $all_files_size = 0;
                         </span></td>
                     <td data-order="b-<?php echo $date_sorting; ?>"><?php echo $modif ?></td>
                     <?php if (!FM_IS_WIN && !$hide_Cols): ?>
-                        <td><?php if (!FM_READONLY): ?><a title="<?php echo 'Change Permissions' ?>" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;chmod=<?php echo urlencode($f) ?>"><?php echo $perms ?></a><?php else: ?><?php echo $perms ?><?php endif; ?>
+                        <td><?php if ($can_chmod): ?><a title="<?php echo 'Change Permissions' ?>" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;chmod=<?php echo urlencode($f) ?>"><?php echo $perms ?></a><?php else: ?><?php echo $perms ?><?php endif; ?>
                         </td>
                         <td><?php echo fm_enc($owner['name'] . ':' . $group['name']) ?></td>
                     <?php endif; ?>
                     <td class="inline-actions">
-                        <?php if (!FM_READONLY): ?>
+                        <?php if ($can_delete): ?>
                             <a title="<?php echo lng('Delete') ?>" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;del=<?php echo urlencode($f) ?>" onclick="confirmDailog(event, 1209, '<?php echo lng('Delete') . ' ' . lng('File'); ?>','<?php echo urlencode($f); ?>', this.href);"> <i class="fa fa-trash-o"></i></a>
+                        <?php endif; ?>
+                        <?php if ($can_rename): ?>
                             <a title="<?php echo lng('Rename') ?>" href="#" onclick="rename('<?php echo fm_enc(addslashes(FM_PATH)) ?>', '<?php echo fm_enc(addslashes($f)) ?>');return false;"><i class="fa fa-pencil-square-o"></i></a>
+                        <?php endif; ?>
+                        <?php if ($can_copy || $can_move): ?>
                             <a title="<?php echo lng('CopyTo') ?>..."
                                 href="?p=<?php echo urlencode(FM_PATH) ?>&amp;copy=<?php echo urlencode(trim(FM_PATH . '/' . $f, '/')) ?>"><i class="fa fa-files-o"></i></a>
                         <?php endif; ?>
-                        <a title="<?php echo lng('DirectLink') ?>" href="<?php echo fm_enc(FM_ROOT_URL . (FM_PATH != '' ? '/' . FM_PATH : '') . '/' . $f) ?>" target="_blank"><i class="fa fa-link"></i></a>
-                        <a title="<?php echo lng('Download') ?>" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;dl=<?php echo urlencode($f) ?>" onclick="confirmDailog(event, 1211, '<?php echo lng('Download'); ?>','<?php echo urlencode($f); ?>', this.href);"><i class="fa fa-download"></i></a>
+                        <?php if ($can_show_link): ?>
+                            <a title="<?php echo lng('DirectLink') ?>" href="<?php echo fm_enc(FM_ROOT_URL . (FM_PATH != '' ? '/' . FM_PATH : '') . '/' . $f) ?>" target="_blank"><i class="fa fa-link"></i></a>
+                        <?php endif; ?>
+                        <?php if ($can_download): ?>
+                            <a title="<?php echo lng('Download') ?>" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;dl=<?php echo urlencode($f) ?>" onclick="confirmDailog(event, 1211, '<?php echo lng('Download'); ?>','<?php echo urlencode($f); ?>', this.href);"><i class="fa fa-download"></i></a>
+                        <?php endif; ?>
                     </td>
                 </tr>
             <?php
@@ -2309,7 +2572,7 @@ $all_files_size = 0;
 
             if (empty($folders) && empty($files)) { ?>
                 <tfoot>
-                    <tr><?php if (!FM_READONLY): ?>
+                    <tr><?php if ($can_select_items): ?>
                             <td></td><?php endif; ?>
                         <td colspan="<?php echo (!FM_IS_WIN && !$hide_Cols) ? '6' : '4' ?>"><em><?php echo lng('Folder is empty') ?></em></td>
                     </tr>
@@ -2318,7 +2581,7 @@ $all_files_size = 0;
             } else { ?>
                 <tfoot>
                     <tr>
-                        <td class="gray fs-7" colspan="<?php echo (!FM_IS_WIN && !$hide_Cols) ? (FM_READONLY ? '6' : '7') : (FM_READONLY ? '4' : '5') ?>">
+                        <td class="gray fs-7" colspan="<?php echo (!FM_IS_WIN && !$hide_Cols) ? ($can_select_items ? '7' : '6') : ($can_select_items ? '5' : '4') ?>">
                             <?php echo lng('FullSize') . ': <span class="badge text-bg-light border-radius-0">' . fm_get_filesize($all_files_size) . '</span>' ?>
                             <?php echo lng('File') . ': <span class="badge text-bg-light border-radius-0">' . $num_files . '</span>' ?>
                             <?php echo lng('Folder') . ': <span class="badge text-bg-light border-radius-0">' . $num_folders . '</span>' ?>
@@ -2330,20 +2593,28 @@ $all_files_size = 0;
     </div>
 
     <div class="row">
-        <?php if (!FM_READONLY): ?>
+        <?php if ($can_select_items): ?>
             <div class="col-xs-12 col-sm-9">
                 <div class="btn-group flex-wrap" data-toggle="buttons" role="toolbar">
                     <a href="#/select-all" class="btn btn-small btn-outline-primary btn-2" onclick="select_all();return false;"><i class="fa fa-check-square"></i> <?php echo lng('SelectAll') ?> </a>
                     <a href="#/unselect-all" class="btn btn-small btn-outline-primary btn-2" onclick="unselect_all();return false;"><i class="fa fa-window-close"></i> <?php echo lng('UnSelectAll') ?> </a>
                     <a href="#/invert-all" class="btn btn-small btn-outline-primary btn-2" onclick="invert_all();return false;"><i class="fa fa-th-list"></i> <?php echo lng('InvertSelection') ?> </a>
-                    <input type="submit" class="hidden" name="delete" id="a-delete" value="Delete" onclick="return confirm('<?php echo lng('Delete selected files and folders?'); ?>')">
-                    <a href="javascript:document.getElementById('a-delete').click();" class="btn btn-small btn-outline-primary btn-2"><i class="fa fa-trash"></i> <?php echo lng('Delete') ?> </a>
-                    <input type="submit" class="hidden" name="zip" id="a-zip" value="zip" onclick="return confirm('<?php echo lng('Create archive?'); ?>')">
-                    <a href="javascript:document.getElementById('a-zip').click();" class="btn btn-small btn-outline-primary btn-2"><i class="fa fa-file-archive-o"></i> <?php echo lng('Zip') ?> </a>
-                    <input type="submit" class="hidden" name="tar" id="a-tar" value="tar" onclick="return confirm('<?php echo lng('Create archive?'); ?>')">
-                    <a href="javascript:document.getElementById('a-tar').click();" class="btn btn-small btn-outline-primary btn-2"><i class="fa fa-file-archive-o"></i> <?php echo lng('Tar') ?> </a>
-                    <input type="submit" class="hidden" name="copy" id="a-copy" value="Copy">
-                    <a href="javascript:document.getElementById('a-copy').click();" class="btn btn-small btn-outline-primary btn-2"><i class="fa fa-files-o"></i> <?php echo lng('Copy') ?> </a>
+                    <?php if ($can_delete): ?>
+                        <input type="submit" class="hidden" name="delete" id="a-delete" value="Delete" onclick="return confirm('<?php echo lng('Delete selected files and folders?'); ?>')">
+                        <a href="javascript:document.getElementById('a-delete').click();" class="btn btn-small btn-outline-primary btn-2"><i class="fa fa-trash"></i> <?php echo lng('Delete') ?> </a>
+                    <?php endif; ?>
+                    <?php if ($can_zip): ?>
+                        <input type="submit" class="hidden" name="zip" id="a-zip" value="zip" onclick="return confirm('<?php echo lng('Create archive?'); ?>')">
+                        <a href="javascript:document.getElementById('a-zip').click();" class="btn btn-small btn-outline-primary btn-2"><i class="fa fa-file-archive-o"></i> <?php echo lng('Zip') ?> </a>
+                    <?php endif; ?>
+                    <?php if ($can_tar): ?>
+                        <input type="submit" class="hidden" name="tar" id="a-tar" value="tar" onclick="return confirm('<?php echo lng('Create archive?'); ?>')">
+                        <a href="javascript:document.getElementById('a-tar').click();" class="btn btn-small btn-outline-primary btn-2"><i class="fa fa-file-archive-o"></i> <?php echo lng('Tar') ?> </a>
+                    <?php endif; ?>
+                    <?php if ($can_copy || $can_move): ?>
+                        <input type="submit" class="hidden" name="copy" id="a-copy" value="Copy">
+                        <a href="javascript:document.getElementById('a-copy').click();" class="btn btn-small btn-outline-primary btn-2"><i class="fa fa-files-o"></i> <?php echo lng('Copy') ?> </a>
+                    <?php endif; ?>
                 </div>
             </div>
             <div class="col-3 d-none d-sm-block"><a href="https://tinyfilemanager.github.io" target="_blank" class="float-right text-muted">Tiny File Manager <?php echo VERSION; ?></a></div>
@@ -3749,24 +4020,28 @@ function fm_show_nav_path($path)
 
             <div class="col-xs-6 col-sm-7">
                 <ul class="navbar-nav justify-content-end" data-bs-theme="<?php echo FM_THEME; ?>">
-                    <li class="nav-item mr-2">
-                        <div class="input-group input-group-sm mr-1" style="margin-top:4px;">
-                            <input type="text" class="form-control" placeholder="<?php echo lng('Search') ?>" aria-label="<?php echo lng('Search') ?>" aria-describedby="search-addon2" id="search-addon">
-                            <div class="input-group-append">
-                                <span class="input-group-text brl-0 brr-0" id="search-addon2"><i class="fa fa-search"></i></span>
-                            </div>
-                            <div class="input-group-append btn-group">
-                                <span class="input-group-text dropdown-toggle brl-0" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false"></span>
-                                <div class="dropdown-menu dropdown-menu-right">
-                                    <a class="dropdown-item" href="<?php echo $path2 = $path ? $path : '.'; ?>" id="js-search-modal" data-bs-toggle="modal" data-bs-target="#searchModal"><?php echo lng('Advanced Search') ?></a>
+                    <?php if (has_permission('can_search')): ?>
+                        <li class="nav-item mr-2">
+                            <div class="input-group input-group-sm mr-1" style="margin-top:4px;">
+                                <input type="text" class="form-control" placeholder="<?php echo lng('Search') ?>" aria-label="<?php echo lng('Search') ?>" aria-describedby="search-addon2" id="search-addon">
+                                <div class="input-group-append">
+                                    <span class="input-group-text brl-0 brr-0" id="search-addon2"><i class="fa fa-search"></i></span>
+                                </div>
+                                <div class="input-group-append btn-group">
+                                    <span class="input-group-text dropdown-toggle brl-0" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false"></span>
+                                    <div class="dropdown-menu dropdown-menu-right">
+                                        <a class="dropdown-item" href="<?php echo $path2 = $path ? $path : '.'; ?>" id="js-search-modal" data-bs-toggle="modal" data-bs-target="#searchModal"><?php echo lng('Advanced Search') ?></a>
+                                    </div>
                                 </div>
                             </div>
-                        </div>
-                    </li>
-                    <?php if (!FM_READONLY): ?>
+                        </li>
+                    <?php endif; ?>
+                    <?php if (has_permission('can_upload') || has_permission('can_upload_url')): ?>
                         <li class="nav-item">
                             <a title="<?php echo lng('Upload') ?>" class="nav-link" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;upload"><i class="fa fa-cloud-upload" aria-hidden="true"></i> <?php echo lng('Upload') ?></a>
                         </li>
+                    <?php endif; ?>
+                    <?php if (has_permission('can_create')): ?>
                         <li class="nav-item">
                             <a title="<?php echo lng('NewItem') ?>" class="nav-link" href="#createNewItem" data-bs-toggle="modal" data-bs-target="#createNewItem"><i class="fa fa-plus-square"></i> <?php echo lng('NewItem') ?></a>
                         </li>
@@ -3778,7 +4053,7 @@ function fm_show_nav_path($path)
                             </a>
 
                             <div class="dropdown-menu dropdown-menu-end text-small shadow" aria-labelledby="navbarDropdownMenuLink-5" data-bs-theme="<?php echo FM_THEME; ?>">
-                                <?php if (!FM_READONLY): ?>
+                                <?php if (has_permission('can_change_settings')): ?>
                                     <a title="<?php echo lng('Settings') ?>" class="dropdown-item nav-link" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;settings=1"><i class="fa fa-cog" aria-hidden="true"></i> <?php echo lng('Settings') ?></a>
                                 <?php endif ?>
                                 <a title="<?php echo lng('Help') ?>" class="dropdown-item nav-link" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;help=2"><i class="fa fa-exclamation-circle" aria-hidden="true"></i> <?php echo lng('Help') ?></a>
@@ -3786,7 +4061,7 @@ function fm_show_nav_path($path)
                             </div>
                         </li>
                     <?php else: ?>
-                        <?php if (!FM_READONLY): ?>
+                        <?php if (has_permission('can_change_settings')): ?>
                             <li class="nav-item">
                                 <a title="<?php echo lng('Settings') ?>" class="dropdown-item nav-link" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;settings=1"><i class="fa fa-cog" aria-hidden="true"></i> <?php echo lng('Settings') ?></a>
                             </li>
@@ -5164,7 +5439,7 @@ function fm_show_header_login()
             });
         </script>
 
-        <?php if (isset($_GET['edit']) && isset($_GET['env']) && FM_EDIT_FILE && !FM_READONLY):
+        <?php if (isset($_GET['edit']) && isset($_GET['env']) && FM_EDIT_FILE && has_permission('can_edit')):
             $ext = pathinfo($_GET["edit"], PATHINFO_EXTENSION);
             $ext =  $ext == "js" ? "javascript" :  $ext;
         ?>
@@ -5590,6 +5865,7 @@ function fm_show_header_login()
         $tr['en']['Error while fetching archive info']              = 'Error while fetching archive info';
         $tr['en']['Delete selected files and folders?']             = 'Delete selected files and folders?';
         $tr['en']['Search file in folder and subfolders...']        = 'Search file in folder and subfolders...';
+        $tr['en']['Access denied']                                  = 'Access denied';
         $tr['en']['Access denied. IP restriction applicable']       = 'Access denied. IP restriction applicable';
         $tr['en']['Invalid characters in file or folder name']      = 'Invalid characters in file or folder name';
         $tr['en']['Operations with archives are not available']     = 'Operations with archives are not available';

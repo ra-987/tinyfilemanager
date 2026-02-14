@@ -46,6 +46,54 @@ To enable/disable authentication set `$use_auth` to true or false.
 
 :information_source: To work offline without CDN resources, use [offline](https://github.com/prasathmani/tinyfilemanager/tree/offline) branch
 
+### Granular permissions
+
+Tiny File Manager supports per-user permission flags via `$auth_permissions`.
+
+```php
+$auth_permissions = array(
+    'admin' => array(
+        'can_browse' => true,
+        'can_view' => true,
+        'can_download' => true,
+        'can_show_link' => true,
+        'can_search' => true,
+        'can_upload' => true,
+        'can_upload_url' => true,
+        'can_create' => true,
+        'can_edit' => true,
+        'can_rename' => true,
+        'can_delete' => true,
+        'can_copy' => true,
+        'can_move' => true,
+        'can_chmod' => true,
+        'can_zip' => true,
+        'can_tar' => true,
+        'can_unzip' => true,
+        'can_change_settings' => true,
+        'can_pwdhash' => true
+    ),
+    'readonly' => array(
+        'can_browse' => true,
+        'can_view' => true,
+        'can_download' => true,
+        'can_search' => true
+    ),
+    'limited' => array(
+        'can_browse' => true,
+        'can_view' => true,
+        'can_download' => true,
+        'can_upload' => true,
+        'can_create' => true
+    )
+);
+```
+
+Migration notes:
+- Existing installations continue to work without `$auth_permissions`.
+- If `$auth_permissions` is not configured, `readonly_users` and `global_readonly` keep their legacy behavior.
+- You can migrate incrementally by adding only the users that need custom permissions.
+
 ### :loudspeaker: Features
 
 - :cd: **Open Source:** Lightweight, minimalist, and extremely simple to set up.
